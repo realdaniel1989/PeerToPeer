@@ -7,11 +7,15 @@
  *
  * The relay kicks in automatically if the WebRTC DataChannel doesn't open
  * within WEBRTC_TIMEOUT ms (e.g. blocked by Zscaler / corporate firewalls).
+ *
+ * IMPORTANT: Only the SENDER triggers the relay switch. The receiver passively
+ * waits for the server to tell it to switch. This avoids duplicate listeners,
+ * double sends, and corrupted files.
  */
 
 const CHUNK_SIZE = 16 * 1024; // 16 KB chunks
-const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB — pause sending when buffered > this
-const WEBRTC_TIMEOUT = 10_000; // 10 s to wait for DataChannel
+const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB backpressure threshold
+const WEBRTC_TIMEOUT = 10_000; // 10 s
 
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -19,40 +23,32 @@ const ICE_SERVERS = [
   { urls: "stun:stun2.l.google.com:19302" },
   { urls: "stun:stun3.l.google.com:19302" },
   { urls: "stun:stun4.l.google.com:19302" },
-  {
-    urls: "turn:openrelay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-  {
-    urls: "turn:openrelay.metered.ca:443",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-  {
-    urls: "turn:openrelay.metered.ca:443?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
+  { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
 ];
 
 // ── Helpers ──
-function arrayBufferToBase64(buffer) {
+function ab2b64(buffer) {
   const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
 }
-
-function base64ToArrayBuffer(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+function b642ab(base64) {
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes.buffer;
 }
+function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ════════════════════════════════════════════════════════════════
 export function createPeerConnection(socket, role, callbacks) {
+  let transferMode = "webrtc"; // "webrtc" | "relay"
+  let destroyed = false;
+
+  // ─────────────── WebRTC setup ───────────────
   const pc = new RTCPeerConnection({
     iceServers: ICE_SERVERS,
     iceCandidatePoolSize: 10,
@@ -61,42 +57,28 @@ export function createPeerConnection(socket, role, callbacks) {
   });
 
   let dc = null;
-  let transferMode = "webrtc"; // "webrtc" | "relay"
   let webrtcTimer = null;
-  let pendingFiles = null; // files queued before relay was ready
-  let manifestData = null; // manifest received (relay), stored for file info lookups
 
-  // ── Relay receive-side state ──
-  let relayRecv = {
-    chunks: [],
-    receivedBytes: 0,
-    startTime: 0,
-    fileIndex: -1,
-  };
-
-  // ── WebRTC receive-side state ──
-  let rtcRecv = {
-    currentFile: null,
-    chunks: [],
-    receivedBytes: 0,
-    startTime: 0,
-  };
-
-  // ────────────────────────────── ICE ──────────────────────────────
   pc.onicecandidate = (e) => {
     if (e.candidate) socket.emit("signal", { type: "ice-candidate", candidate: e.candidate });
   };
 
   pc.onconnectionstatechange = () => {
-    callbacks.onConnectionState?.(pc.connectionState);
-    if (pc.connectionState === "failed") {
-      console.warn("[webrtc] ICE connection failed → relay");
-      switchToRelay();
+    // ONLY report WebRTC connection states while still in webrtc mode
+    if (transferMode === "webrtc") {
+      callbacks.onConnectionState?.(pc.connectionState);
     }
+    // If ICE fails and we're the sender, trigger relay
+    if (pc.connectionState === "failed" && role === "sender" && transferMode === "webrtc") {
+      console.warn("[webrtc] ICE failed → switching to relay");
+      doSwitchToRelay();
+    }
+    // Receiver does NOT call switchToRelay — it waits for server "relay-mode" event
   };
 
-  // ────────────────────────── Signaling ────────────────────────────
+  // ─────────────── Signaling ───────────────
   const handleSignal = async (data) => {
+    if (destroyed || transferMode === "relay") return;
     try {
       if (data.type === "offer") {
         await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
@@ -114,18 +96,23 @@ export function createPeerConnection(socket, role, callbacks) {
   };
   socket.on("signal", handleSignal);
 
-  // ────────────────── Sender: DataChannel + offer ──────────────────
+  // ─────────────── Sender: DataChannel + offer ───────────────
   if (role === "sender") {
     dc = pc.createDataChannel("file-transfer", { ordered: true });
     dc.binaryType = "arraybuffer";
-    dc.onopen = () => { clearTimeout(webrtcTimer); callbacks.onChannelOpen?.(); };
-    dc.onclose = () => callbacks.onChannelClose?.();
-    dc.onerror = () => switchToRelay();
+    dc.onopen = () => {
+      clearTimeout(webrtcTimer);
+      if (transferMode === "webrtc") callbacks.onChannelOpen?.();
+    };
+    dc.onclose = () => {};
+    dc.onerror = () => {
+      if (transferMode === "webrtc") doSwitchToRelay();
+    };
 
     webrtcTimer = setTimeout(() => {
-      if (!dc || dc.readyState !== "open") {
+      if (transferMode === "webrtc" && (!dc || dc.readyState !== "open")) {
         console.warn("[webrtc] DataChannel timeout → relay");
-        switchToRelay();
+        doSwitchToRelay();
       }
     }, WEBRTC_TIMEOUT);
 
@@ -136,111 +123,122 @@ export function createPeerConnection(socket, role, callbacks) {
     })();
   }
 
-  // ────────────────── Receiver: accept DataChannel ─────────────────
+  // ─────────────── Receiver: accept DataChannel ───────────────
   if (role === "receiver") {
     pc.ondatachannel = (e) => {
       dc = e.channel;
       dc.binaryType = "arraybuffer";
-      dc.onopen = () => { clearTimeout(webrtcTimer); callbacks.onChannelOpen?.(); };
-      dc.onclose = () => callbacks.onChannelClose?.();
+      dc.onopen = () => {
+        clearTimeout(webrtcTimer);
+        if (transferMode === "webrtc") callbacks.onChannelOpen?.();
+      };
+      dc.onclose = () => {};
       dc.onerror = () => {};
-      dc.onmessage = (evt) => handleRtcMessage(evt);
+      dc.onmessage = (evt) => {
+        if (transferMode === "webrtc") handleRtcMessage(evt);
+      };
     };
-
-    webrtcTimer = setTimeout(() => {
-      // Just log — receiver waits for sender to trigger relay
-      if (!dc || dc.readyState !== "open") {
-        console.warn("[webrtc] Receiver: DataChannel not open yet, waiting for relay…");
-      }
-    }, WEBRTC_TIMEOUT);
+    // Receiver does NOT set a timeout that triggers relay.
+    // It passively waits for the server's "relay-mode" event.
   }
 
-  // ═══════════════════════ RELAY MODE SETUP ════════════════════════
-  // Receiver: server tells us to switch
-  socket.on("relay-mode", () => {
-    console.log("[relay] Receiver switching to relay mode");
+  // ═══════════════════ RELAY: sender-only switch ═══════════════
+  let relaySwitchDone = false;
+
+  function doSwitchToRelay() {
+    if (relaySwitchDone || transferMode === "relay" || role !== "sender") return;
+    relaySwitchDone = true;
     transferMode = "relay";
+    clearTimeout(webrtcTimer);
+
+    // Tear down WebRTC quietly
+    try { dc?.close(); } catch (_) {}
+    try { pc.close(); } catch (_) {}
+
+    socket.emit("switch-to-relay", (res) => {
+      if (res?.ok) {
+        console.log("[relay] Sender: relay mode active");
+        callbacks.onConnectionState?.("relay");
+        callbacks.onChannelOpen?.();
+      }
+    });
+  }
+
+  // ═══════════════════ RELAY: receiver listeners ═══════════════
+  // These only do anything when transferMode === "relay"
+  let manifestData = null; // [{name, size, type}, …]
+  let relayRecv = { chunks: [], receivedBytes: 0, startTime: 0, fileIndex: -1 };
+
+  const onRelayMode = () => {
+    if (transferMode === "relay") return; // already switched, ignore duplicate
+    console.log("[relay] Receiver: relay mode active");
+    transferMode = "relay";
+    clearTimeout(webrtcTimer);
+
+    // Tear down WebRTC quietly on receiver side too
+    try { dc?.close(); } catch (_) {}
+    try { pc.close(); } catch (_) {}
+
     callbacks.onConnectionState?.("relay");
     callbacks.onChannelOpen?.();
-  });
+  };
 
-  // Receiver: manifest arrives
-  socket.on("relay-manifest", (files) => {
-    manifestData = files; // [{name, size, type}, …]
+  const onRelayManifest = (files) => {
+    if (transferMode !== "relay") return;
+    manifestData = files;
     callbacks.onManifest?.(files);
-  });
+  };
 
-  // Receiver: file-start (sent before first chunk of each file)
-  socket.on("relay-file-start", (info) => {
-    // info = { index, name, size, mimeType }
+  const onRelayFileStart = (info) => {
+    if (transferMode !== "relay") return;
     relayRecv = { chunks: [], receivedBytes: 0, startTime: performance.now(), fileIndex: info.index };
     callbacks.onReceiveFileStart?.(info.index, info.name, info.size);
-  });
+  };
 
-  // Receiver: a chunk arrives
-  socket.on("relay-chunk", (data) => {
-    // data = { fileIndex, chunkIndex, totalChunks, data (base64) }
-    const buf = base64ToArrayBuffer(data.data);
+  const onRelayChunk = (data) => {
+    if (transferMode !== "relay") return;
+    const buf = b642ab(data.data);
     relayRecv.chunks.push(buf);
     relayRecv.receivedBytes += buf.byteLength;
 
-    // Look up total size from manifest
     const fileMeta = manifestData?.[data.fileIndex];
     const totalSize = fileMeta?.size ?? relayRecv.receivedBytes;
     const elapsed = (performance.now() - relayRecv.startTime) / 1000 || 0.001;
     const speed = relayRecv.receivedBytes / elapsed;
-    const remaining = totalSize > relayRecv.receivedBytes
-      ? (totalSize - relayRecv.receivedBytes) / speed
-      : 0;
-
+    const remaining = totalSize > relayRecv.receivedBytes ? (totalSize - relayRecv.receivedBytes) / speed : 0;
     callbacks.onReceiveProgress?.(data.fileIndex, relayRecv.receivedBytes, totalSize, speed, remaining);
-  });
+  };
 
-  // Receiver: one file finished
-  socket.on("relay-file-complete", (index) => {
+  const onRelayFileComplete = (index) => {
+    if (transferMode !== "relay") return;
     const fileMeta = manifestData?.[index];
-    const blob = new Blob(relayRecv.chunks, {
-      type: fileMeta?.type || "application/octet-stream",
-    });
+    const blob = new Blob(relayRecv.chunks, { type: fileMeta?.type || "application/octet-stream" });
+    console.log(`[relay] File complete: ${fileMeta?.name} — ${blob.size} bytes (expected ${fileMeta?.size})`);
     callbacks.onReceiveFileComplete?.(index, fileMeta?.name ?? `file-${index}`, blob);
     relayRecv = { chunks: [], receivedBytes: 0, startTime: 0, fileIndex: -1 };
-  });
+  };
 
-  // Receiver: all files finished
-  socket.on("relay-transfer-complete", () => {
+  const onRelayTransferComplete = () => {
+    if (transferMode !== "relay") return;
     callbacks.onAllReceiveComplete?.();
-  });
+  };
 
-  // ═══════════════════ SWITCH TO RELAY (sender) ═══════════════════
-  function switchToRelay() {
-    if (transferMode === "relay") return;
-    transferMode = "relay";
-    clearTimeout(webrtcTimer);
-
-    try { dc?.close(); } catch (_) {}
-    try { pc.close(); } catch (_) {}
-
-    if (role === "sender") {
-      socket.emit("switch-to-relay", (res) => {
-        if (res?.ok) {
-          console.log("[relay] Sender switched to relay mode");
-          callbacks.onConnectionState?.("relay");
-          callbacks.onChannelOpen?.();
-          if (pendingFiles) sendFilesViaRelay(pendingFiles);
-        }
-      });
-    }
+  // Register relay listeners only for receiver
+  if (role === "receiver") {
+    socket.on("relay-mode", onRelayMode);
+    socket.on("relay-manifest", onRelayManifest);
+    socket.on("relay-file-start", onRelayFileStart);
+    socket.on("relay-chunk", onRelayChunk);
+    socket.on("relay-file-complete", onRelayFileComplete);
+    socket.on("relay-transfer-complete", onRelayTransferComplete);
   }
 
-  // ═══════════════════════ SEND FILES ═════════════════════════════
+  // ═══════════════════════ SEND FILES ═════════════════════════
   async function sendFiles(files) {
-    pendingFiles = files;
-
     if (transferMode === "relay") return sendFilesViaRelay(files);
 
     // ── WebRTC path ──
     if (!dc || dc.readyState !== "open") throw new Error("DataChannel not open");
-
     const fileList = Array.from(files);
     const manifest = fileList.map((f) => ({ name: f.name, size: f.size, type: f.type }));
     dc.send(JSON.stringify({ type: "manifest", files: manifest }));
@@ -248,56 +246,44 @@ export function createPeerConnection(socket, role, callbacks) {
     for (let fi = 0; fi < fileList.length; fi++) {
       const file = fileList[fi];
       callbacks.onSendFileStart?.(fi, file.name, file.size);
-
       const buffer = await file.arrayBuffer();
       const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
-      dc.send(JSON.stringify({
-        type: "file-start", index: fi, name: file.name,
-        size: file.size, mimeType: file.type, totalChunks,
-      }));
+      dc.send(JSON.stringify({ type: "file-start", index: fi, name: file.name, size: file.size, mimeType: file.type, totalChunks }));
 
       let sentBytes = 0;
       const t0 = performance.now();
-
       for (let c = 0; c < totalChunks; c++) {
         const start = c * CHUNK_SIZE;
         const chunk = buffer.slice(start, Math.min(start + CHUNK_SIZE, buffer.byteLength));
         while (dc.bufferedAmount > BUFFER_THRESHOLD) await delay(20);
         dc.send(chunk);
         sentBytes += chunk.byteLength;
-        const elapsed = (performance.now() - t0) / 1000;
+        const elapsed = (performance.now() - t0) / 1000 || 0.001;
         callbacks.onSendProgress?.(fi, sentBytes, file.size, sentBytes / elapsed, (file.size - sentBytes) / (sentBytes / elapsed));
       }
-
       dc.send(JSON.stringify({ type: "file-end", index: fi }));
       callbacks.onSendFileComplete?.(fi);
     }
-
     dc.send(JSON.stringify({ type: "transfer-complete" }));
     callbacks.onAllSendComplete?.();
   }
 
-  // ── Relay send path ──
+  // ── Relay send path (sender only) ──
   async function sendFilesViaRelay(files) {
     const fileList = Array.from(files);
 
     // 1. Manifest
     const manifest = fileList.map((f) => ({ name: f.name, size: f.size, type: f.type }));
     socket.emit("relay-manifest", manifest);
-    await delay(100); // give receiver time to process manifest
+    await delay(200); // receiver needs time to process manifest
 
     for (let fi = 0; fi < fileList.length; fi++) {
       const file = fileList[fi];
       callbacks.onSendFileStart?.(fi, file.name, file.size);
 
-      // 2. File-start signal (so receiver can init state)
-      socket.emit("relay-file-start", {
-        index: fi,
-        name: file.name,
-        size: file.size,
-        mimeType: file.type,
-      });
-      await delay(50);
+      // 2. File-start
+      socket.emit("relay-file-start", { index: fi, name: file.name, size: file.size, mimeType: file.type });
+      await delay(100); // receiver needs time to init state
 
       const buffer = await file.arrayBuffer();
       const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
@@ -309,16 +295,12 @@ export function createPeerConnection(socket, role, callbacks) {
         const end = Math.min(start + CHUNK_SIZE, buffer.byteLength);
         const chunk = buffer.slice(start, end);
 
-        // Emit and wait for server ack before sending next chunk
+        // Emit with ack-based backpressure
         await new Promise((resolve) => {
           socket.emit("relay-chunk", {
-            fileIndex: fi,
-            chunkIndex: c,
-            totalChunks,
-            data: arrayBufferToBase64(chunk),
-          }, () => resolve()); // server ack callback
-          // Fallback: if server doesn't ack within 5s, continue anyway
-          setTimeout(resolve, 5000);
+            fileIndex: fi, chunkIndex: c, totalChunks, data: ab2b64(chunk),
+          }, () => resolve());
+          setTimeout(resolve, 5000); // safety fallback
         });
 
         sentBytes += chunk.byteLength;
@@ -327,7 +309,7 @@ export function createPeerConnection(socket, role, callbacks) {
         callbacks.onSendProgress?.(fi, sentBytes, file.size, speed, (file.size - sentBytes) / speed);
       }
 
-      // 3. File-end
+      // 3. File-end with ack
       await new Promise((resolve) => {
         socket.emit("relay-file-complete", fi, () => resolve());
         setTimeout(resolve, 5000);
@@ -335,12 +317,13 @@ export function createPeerConnection(socket, role, callbacks) {
       callbacks.onSendFileComplete?.(fi);
     }
 
-    // 4. All done
     socket.emit("relay-transfer-complete");
     callbacks.onAllSendComplete?.();
   }
 
-  // ═════════════════ WebRTC RECEIVE (unchanged logic) ═════════════
+  // ═════════════════ WebRTC RECEIVE ═════════════════
+  let rtcRecv = { currentFile: null, chunks: [], receivedBytes: 0, startTime: 0 };
+
   function handleRtcMessage(evt) {
     if (typeof evt.data === "string") {
       const msg = JSON.parse(evt.data);
@@ -361,28 +344,26 @@ export function createPeerConnection(socket, role, callbacks) {
       rtcRecv.receivedBytes += evt.data.byteLength;
       const elapsed = (performance.now() - rtcRecv.startTime) / 1000 || 0.001;
       const speed = rtcRecv.receivedBytes / elapsed;
-      const remaining = (rtcRecv.currentFile.size - rtcRecv.receivedBytes) / speed;
-      callbacks.onReceiveProgress?.(rtcRecv.currentFile.index, rtcRecv.receivedBytes, rtcRecv.currentFile.size, speed, remaining);
+      callbacks.onReceiveProgress?.(rtcRecv.currentFile.index, rtcRecv.receivedBytes, rtcRecv.currentFile.size, speed, (rtcRecv.currentFile.size - rtcRecv.receivedBytes) / speed);
     }
   }
 
   // ═══════════════════════ CLEANUP ════════════════════════════════
   function destroy() {
+    destroyed = true;
     clearTimeout(webrtcTimer);
     socket.off("signal", handleSignal);
-    socket.off("relay-mode");
-    socket.off("relay-manifest");
-    socket.off("relay-file-start");
-    socket.off("relay-chunk");
-    socket.off("relay-file-complete");
-    socket.off("relay-transfer-complete");
+    if (role === "receiver") {
+      socket.off("relay-mode", onRelayMode);
+      socket.off("relay-manifest", onRelayManifest);
+      socket.off("relay-file-start", onRelayFileStart);
+      socket.off("relay-chunk", onRelayChunk);
+      socket.off("relay-file-complete", onRelayFileComplete);
+      socket.off("relay-transfer-complete", onRelayTransferComplete);
+    }
     try { dc?.close(); } catch (_) {}
     try { pc.close(); } catch (_) {}
   }
 
-  return { pc, sendFiles, destroy, switchToRelay };
-}
-
-function delay(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return { pc, sendFiles, destroy };
 }

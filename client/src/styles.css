@@ -481,6 +481,12 @@ body {
   border: 1px solid rgba(255, 170, 34, 0.2);
 }
 
+.conn-relay {
+  color: #6ec6ff;
+  background: rgba(110, 198, 255, 0.1);
+  border: 1px solid rgba(110, 198, 255, 0.25);
+}
+
 .conn-disconnected,
 .conn-failed,
 .conn-closed {
