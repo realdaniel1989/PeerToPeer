@@ -10,8 +10,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5gb" }));
-app.use(express.raw({ limit: "5gb", type: "application/octet-stream" }));
 
 // ── Serve React static build in production ──
 const distPath = path.join(__dirname, "..", "client", "dist");
@@ -20,32 +18,27 @@ app.use(express.static(distPath));
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 100e6, // 100 MB for large chunks
+  maxHttpBufferSize: 5e6, // 5 MB per message (base64 chunk ≈ 22 KB)
 });
 
-// Maps: code -> { sender: socketId, receiver: socketId | null, transferMode: "webrtc" | "relay" }
+// Maps: code -> { sender, receiver, transferMode }
 const rooms = new Map();
 
 function generateCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
   const bytes = crypto.randomBytes(6);
-  for (let i = 0; i < 6; i++) {
-    code += chars[bytes[i] % chars.length];
-  }
+  for (let i = 0; i < 6; i++) code += chars[bytes[i] % chars.length];
   return code;
 }
 
 io.on("connection", (socket) => {
   console.log(`[+] ${socket.id}`);
 
-  // Sender creates a room and gets a code
+  // ── Room management ──
   socket.on("create-room", (callback) => {
     let code;
-    do {
-      code = generateCode();
-    } while (rooms.has(code));
-
+    do { code = generateCode(); } while (rooms.has(code));
     rooms.set(code, { sender: socket.id, receiver: null, transferMode: "webrtc" });
     socket.join(code);
     socket.data.code = code;
@@ -54,88 +47,93 @@ io.on("connection", (socket) => {
     callback({ code });
   });
 
-  // Receiver joins with a code
   socket.on("join-room", (code, callback) => {
     const upper = code.toUpperCase().trim();
     const room = rooms.get(upper);
-
-    if (!room) {
-      return callback({ error: "Invalid code. No active session found." });
-    }
-    if (room.receiver) {
-      return callback({ error: "Session already has a receiver connected." });
-    }
+    if (!room) return callback({ error: "Invalid code. No active session found." });
+    if (room.receiver) return callback({ error: "Session already has a receiver connected." });
 
     room.receiver = socket.id;
     socket.join(upper);
     socket.data.code = upper;
     socket.data.role = "receiver";
-
-    // Tell sender the receiver is here — sender initiates WebRTC
     io.to(room.sender).emit("peer-joined");
     console.log(`[room] ${upper} receiver joined: ${socket.id}`);
     callback({ ok: true });
   });
 
-  // Relay WebRTC signaling (offer, answer, ice-candidate)
+  // ── WebRTC signaling relay ──
   socket.on("signal", (data) => {
     const code = socket.data.code;
-    if (!code) return;
-    // Forward to the other peer in the room
-    socket.to(code).emit("signal", data);
+    if (code) socket.to(code).emit("signal", data);
   });
 
-  // ── RELAY MODE: Fallback when WebRTC is blocked ──
-  
-  // Sender requests switch to relay mode
+  // ══════════════ SERVER RELAY (fallback) ══════════════
+
   socket.on("switch-to-relay", (callback) => {
     const code = socket.data.code;
-    if (!code || !rooms.has(code)) return callback({ error: "No room" });
-    
-    const room = rooms.get(code);
+    const room = code && rooms.get(code);
+    if (!room) return callback?.({ error: "No room" });
+
     room.transferMode = "relay";
-    console.log(`[room] ${code} switched to relay mode`);
-    
-    // Notify receiver to switch to relay mode
+    console.log(`[relay] ${code} switched to relay mode`);
     io.to(room.receiver).emit("relay-mode");
     callback({ ok: true });
   });
 
-  // Relay file manifest
+  // Manifest: sender → server → receiver
   socket.on("relay-manifest", (manifest) => {
     const code = socket.data.code;
-    if (!code) return;
-    socket.to(code).emit("relay-manifest", manifest);
+    if (code) {
+      console.log(`[relay] ${code} manifest: ${manifest.length} file(s)`);
+      socket.to(code).emit("relay-manifest", manifest);
+    }
   });
 
-  // Relay file chunk
-  socket.on("relay-chunk", (data) => {
+  // File-start: sender → server → receiver (carries name, size, mimeType)
+  socket.on("relay-file-start", (info) => {
     const code = socket.data.code;
-    if (!code) return;
-    socket.to(code).emit("relay-chunk", data);
+    if (code) {
+      console.log(`[relay] ${code} file-start: ${info.name} (${info.size} bytes)`);
+      socket.to(code).emit("relay-file-start", info);
+    }
   });
 
-  // Relay file complete signal
-  socket.on("relay-file-complete", (index) => {
+  // Chunk: sender → server → receiver (with ack back to sender)
+  socket.on("relay-chunk", (data, ack) => {
     const code = socket.data.code;
-    if (!code) return;
-    socket.to(code).emit("relay-file-complete", index);
+    if (code) {
+      socket.to(code).emit("relay-chunk", data);
+    }
+    // Acknowledge to sender so it can send next chunk (backpressure)
+    if (typeof ack === "function") ack();
   });
 
-  // Relay transfer complete signal
+  // File-complete: sender → server → receiver
+  socket.on("relay-file-complete", (index, ack) => {
+    const code = socket.data.code;
+    if (code) {
+      console.log(`[relay] ${code} file-complete: index=${index}`);
+      socket.to(code).emit("relay-file-complete", index);
+    }
+    if (typeof ack === "function") ack();
+  });
+
+  // Transfer-complete: sender → server → receiver
   socket.on("relay-transfer-complete", () => {
     const code = socket.data.code;
-    if (!code) return;
-    socket.to(code).emit("relay-transfer-complete");
+    if (code) {
+      console.log(`[relay] ${code} transfer-complete`);
+      socket.to(code).emit("relay-transfer-complete");
+    }
   });
 
+  // ── Disconnect cleanup ──
   socket.on("disconnect", () => {
     const code = socket.data.code;
     if (code && rooms.has(code)) {
       const room = rooms.get(code);
-      // Notify the other peer
       socket.to(code).emit("peer-disconnected");
-      // If the sender leaves, destroy the room
       if (socket.data.role === "sender") {
         rooms.delete(code);
         console.log(`[room] ${code} destroyed (sender left)`);
@@ -149,7 +147,7 @@ io.on("connection", (socket) => {
 
 app.get("/health", (_, res) => res.json({ status: "ok", rooms: rooms.size }));
 
-// ── SPA fallback: serve index.html for any non-API/non-asset route ──
+// SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(path.join(distPath, "index.html"));
 });
