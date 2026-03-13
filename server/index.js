@@ -10,6 +10,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: "5gb" }));
+app.use(express.raw({ limit: "5gb", type: "application/octet-stream" }));
 
 // ── Serve React static build in production ──
 const distPath = path.join(__dirname, "..", "client", "dist");
@@ -18,9 +20,10 @@ app.use(express.static(distPath));
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
+  maxHttpBufferSize: 100e6, // 100 MB for large chunks
 });
 
-// Maps: code -> { sender: socketId, receiver: socketId | null }
+// Maps: code -> { sender: socketId, receiver: socketId | null, transferMode: "webrtc" | "relay" }
 const rooms = new Map();
 
 function generateCode() {
@@ -43,7 +46,7 @@ io.on("connection", (socket) => {
       code = generateCode();
     } while (rooms.has(code));
 
-    rooms.set(code, { sender: socket.id, receiver: null });
+    rooms.set(code, { sender: socket.id, receiver: null, transferMode: "webrtc" });
     socket.join(code);
     socket.data.code = code;
     socket.data.role = "sender";
@@ -80,6 +83,50 @@ io.on("connection", (socket) => {
     if (!code) return;
     // Forward to the other peer in the room
     socket.to(code).emit("signal", data);
+  });
+
+  // ── RELAY MODE: Fallback when WebRTC is blocked ──
+  
+  // Sender requests switch to relay mode
+  socket.on("switch-to-relay", (callback) => {
+    const code = socket.data.code;
+    if (!code || !rooms.has(code)) return callback({ error: "No room" });
+    
+    const room = rooms.get(code);
+    room.transferMode = "relay";
+    console.log(`[room] ${code} switched to relay mode`);
+    
+    // Notify receiver to switch to relay mode
+    io.to(room.receiver).emit("relay-mode");
+    callback({ ok: true });
+  });
+
+  // Relay file manifest
+  socket.on("relay-manifest", (manifest) => {
+    const code = socket.data.code;
+    if (!code) return;
+    socket.to(code).emit("relay-manifest", manifest);
+  });
+
+  // Relay file chunk
+  socket.on("relay-chunk", (data) => {
+    const code = socket.data.code;
+    if (!code) return;
+    socket.to(code).emit("relay-chunk", data);
+  });
+
+  // Relay file complete signal
+  socket.on("relay-file-complete", (index) => {
+    const code = socket.data.code;
+    if (!code) return;
+    socket.to(code).emit("relay-file-complete", index);
+  });
+
+  // Relay transfer complete signal
+  socket.on("relay-transfer-complete", () => {
+    const code = socket.data.code;
+    if (!code) return;
+    socket.to(code).emit("relay-transfer-complete");
   });
 
   socket.on("disconnect", () => {
