@@ -7,14 +7,43 @@
 const CHUNK_SIZE = 16 * 1024; // 16 KB chunks
 const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB — pause sending when buffered > this
 
+// Free public TURN servers for firewall traversal
+// These help establish connections when direct P2P is blocked by corporate firewalls (Zscaler, etc.)
 const ICE_SERVERS = [
+  // STUN servers for initial connection discovery
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun2.l.google.com:19302" },
+  { urls: "stun:stun3.l.google.com:19302" },
+  { urls: "stun:stun4.l.google.com:19302" },
+
+  // Free public TURN servers (relay) for firewall traversal
+  // Open Relay Project - free TURN service
+  {
+    urls: "turn:openrelay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443?transport=tcp",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
 
 export function createPeerConnection(socket, role, callbacks) {
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const pc = new RTCPeerConnection({
+    iceServers: ICE_SERVERS,
+    // Improve connection reliability behind firewalls
+    iceCandidatePoolSize: 10,
+    bundlePolicy: "max-bundle",
+    rtcpMuxPolicy: "require",
+  });
   let dc = null; // DataChannel
 
   // ── ICE candidate relay ──
