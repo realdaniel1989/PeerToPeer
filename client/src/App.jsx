@@ -83,10 +83,20 @@ export default function App() {
     const selected = Array.from(e.target.files);
     if (!selected.length) return;
 
-    const hasLarge = selected.some((f) => f.size > SIZE_WARNING);
+    const allFiles = [...files, ...selected];
+    const hasLarge = allFiles.some((f) => f.size > SIZE_WARNING);
     if (hasLarge) setSizeWarning(true);
 
-    setFiles(selected);
+    setFiles(allFiles);
+    // Reset input so selecting same files again still triggers onChange
+    e.target.value = "";
+  };
+
+  const removeFile = (index) => {
+    const newFiles = files.filter((_, i) => i !== index);
+    const hasLarge = newFiles.some((f) => f.size > SIZE_WARNING);
+    if (!hasLarge) setSizeWarning(false);
+    setFiles(newFiles);
   };
 
   const handleStartSend = useCallback(() => {
@@ -275,7 +285,7 @@ export default function App() {
                       className="btn btn-primary"
                       onClick={() => fileInputRef.current?.click()}
                     >
-                      Choose Files
+                      Add Files
                     </button>
                   ) : (
                     <div className="selected-files">
@@ -284,8 +294,18 @@ export default function App() {
                           <div key={i} className="file-tag">
                             <span className="file-tag-name">{f.name}</span>
                             <span className="file-tag-size">{formatBytes(f.size)}</span>
+                            <button
+                              className="file-tag-remove"
+                              onClick={() => removeFile(i)}
+                              title="Remove file"
+                            >
+                              ×
+                            </button>
                           </div>
                         ))}
+                      </div>
+                      <div className="file-summary">
+                        {files.length} file{files.length !== 1 ? "s" : ""} · {formatBytes(files.reduce((sum, f) => sum + f.size, 0))}
                       </div>
                       {sizeWarning && (
                         <div className="warning-badge">
@@ -293,8 +313,11 @@ export default function App() {
                         </div>
                       )}
                       <div className="file-actions">
+                        <button className="btn btn-ghost" onClick={() => fileInputRef.current?.click()}>
+                          + Add More
+                        </button>
                         <button className="btn btn-ghost" onClick={() => { setFiles([]); setSizeWarning(false); }}>
-                          Clear
+                          Clear All
                         </button>
                         <button className="btn btn-primary" onClick={handleStartSend}>
                           Get Code →

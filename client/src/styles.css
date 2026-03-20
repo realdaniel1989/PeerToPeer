@@ -287,6 +287,31 @@ body {
   flex-shrink: 0;
 }
 
+.file-tag-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+  margin-left: 0.2rem;
+  opacity: 0.6;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.file-tag-remove:hover {
+  opacity: 1;
+  color: var(--danger);
+}
+
+.file-summary {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  text-align: center;
+}
+
 .file-actions {
   display: flex;
   gap: 0.6rem;
