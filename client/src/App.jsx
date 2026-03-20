@@ -30,6 +30,21 @@ const SIGNAL_URL =
 
 const SIZE_WARNING = 3 * 1024 * 1024 * 1024; // 3 GB
 
+// ── Animation Config (Apple-style spring physics) ──
+const springConfig = {
+  type: "spring",
+  stiffness: 400,
+  damping: 30,
+  mass: 1,
+};
+
+const springConfigGentle = {
+  type: "spring",
+  stiffness: 280,
+  damping: 25,
+  mass: 1,
+};
+
 // ── App ──
 export default function App() {
   const [view, setView] = useState("home"); // home | send | receive
@@ -38,19 +53,21 @@ export default function App() {
   const [status, setStatus] = useState("idle"); // idle | waiting | connected | transferring | done | error
   const [error, setError] = useState("");
   const [files, setFiles] = useState([]);
-  const [fileProgress, setFileProgress] = useState({}); // { [index]: { sent, total, speed, eta } }
-  const [receivedFiles, setReceivedFiles] = useState([]); // [{ name, blob }]
+  const [fileProgress, setFileProgress] = useState({});
+  const [receivedFiles, setReceivedFiles] = useState([]);
   const [manifest, setManifest] = useState(null);
   const [currentFileIndex, setCurrentFileIndex] = useState(-1);
   const [connectionState, setConnectionState] = useState("");
   const [overallDone, setOverallDone] = useState(false);
   const [sizeWarning, setSizeWarning] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const socketRef = useRef(null);
   const peerRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Cleanup on unmount or view change
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       peerRef.current?.destroy();
@@ -76,21 +93,41 @@ export default function App() {
     setConnectionState("");
     setOverallDone(false);
     setSizeWarning(false);
+    setIsDragOver(false);
+    setCopied(false);
   };
 
-  // ── SENDER FLOW ──
-  const handleSelectFiles = (e) => {
-    const selected = Array.from(e.target.files);
-    if (!selected.length) return;
-
-    const allFiles = [...files, ...selected];
+  // ── FILE HANDLING ──
+  const addFiles = useCallback((newFiles) => {
+    if (!newFiles.length) return;
+    const allFiles = [...files, ...newFiles];
     const hasLarge = allFiles.some((f) => f.size > SIZE_WARNING);
     if (hasLarge) setSizeWarning(true);
-
     setFiles(allFiles);
-    // Reset input so selecting same files again still triggers onChange
+  }, [files]);
+
+  const handleSelectFiles = (e) => {
+    const selected = Array.from(e.target.files);
+    addFiles(selected);
     e.target.value = "";
   };
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const dropped = Array.from(e.dataTransfer.files);
+    addFiles(dropped);
+  }, [addFiles]);
+
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  }, []);
 
   const removeFile = (index) => {
     const newFiles = files.filter((_, i) => i !== index);
@@ -99,6 +136,13 @@ export default function App() {
     setFiles(newFiles);
   };
 
+  const handleCopyCode = async () => {
+    await navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  // ── SENDER FLOW ──
   const handleStartSend = useCallback(() => {
     if (!files.length) return;
 
@@ -125,14 +169,9 @@ export default function App() {
           peer.sendFiles(files);
         },
         onChannelClose: () => {},
-        onSendFileStart: (idx, name, size) => {
-          setCurrentFileIndex(idx);
-        },
+        onSendFileStart: (idx) => setCurrentFileIndex(idx),
         onSendProgress: (idx, sent, total, speed, eta) => {
-          setFileProgress((prev) => ({
-            ...prev,
-            [idx]: { sent, total, speed, eta },
-          }));
+          setFileProgress((prev) => ({ ...prev, [idx]: { sent, total, speed, eta } }));
         },
         onSendFileComplete: (idx) => {
           setFileProgress((prev) => ({
@@ -183,14 +222,9 @@ export default function App() {
           onChannelOpen: () => setStatus("transferring"),
           onChannelClose: () => {},
           onManifest: (m) => setManifest(m),
-          onReceiveFileStart: (idx, name, size) => {
-            setCurrentFileIndex(idx);
-          },
+          onReceiveFileStart: (idx) => setCurrentFileIndex(idx),
           onReceiveProgress: (idx, received, total, speed, eta) => {
-            setFileProgress((prev) => ({
-              ...prev,
-              [idx]: { sent: received, total, speed, eta },
-            }));
+            setFileProgress((prev) => ({ ...prev, [idx]: { sent: received, total, speed, eta } }));
           },
           onReceiveFileComplete: (idx, name, blob) => {
             setReceivedFiles((prev) => [...prev, { name, blob }]);
@@ -230,6 +264,10 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const downloadAll = () => {
+    receivedFiles.forEach(({ name, blob }) => downloadFile(name, blob));
+  };
+
   // ── RENDER ──
   return (
     <div className="app">
@@ -240,13 +278,21 @@ export default function App() {
         <motion.h1
           className="logo"
           onClick={reset}
-          initial={{ opacity: 0, y: -20 }}
+          initial={{ opacity: 0, y: -16 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
+          transition={springConfigGentle}
+          whileTap={{ scale: 0.97 }}
         >
           DROP<span className="logo-dot">.</span>
         </motion.h1>
-        <p className="tagline">browser-to-browser · no cloud · no limits</p>
+        <motion.p
+          className="tagline"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.2, duration: 0.5 }}
+        >
+          browser-to-browser · no cloud · no limits
+        </motion.p>
       </header>
 
       <main className="main">
@@ -256,21 +302,46 @@ export default function App() {
             <motion.div
               key="home"
               className="panel home-panel"
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              transition={{ duration: 0.35 }}
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -16 }}
+              transition={springConfigGentle}
             >
               <div className="home-grid">
-                {/* SEND */}
+                {/* SEND CARD */}
                 <motion.div
                   className="home-card send-card"
-                  whileHover={{ y: -4 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 25 }}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ ...springConfig, delay: 0.1 }}
+                  whileHover={{ y: -4, transition: { duration: 0.2 } }}
                 >
-                  <div className="card-icon">↑</div>
-                  <h2>Send</h2>
-                  <p>Select files and get a code to share</p>
+                  <motion.div
+                    className="card-icon"
+                    initial={{ scale: 0.8, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ ...springConfig, delay: 0.2 }}
+                  >
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="17 8 12 3 7 8" />
+                      <line x1="12" y1="3" x2="12" y2="15" />
+                    </svg>
+                  </motion.div>
+                  <motion.h2
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.25 }}
+                  >
+                    Send
+                  </motion.h2>
+                  <motion.p
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.3 }}
+                  >
+                    Select files and get a code to share
+                  </motion.p>
 
                   <input
                     type="file"
@@ -281,62 +352,127 @@ export default function App() {
                   />
 
                   {files.length === 0 ? (
-                    <button
-                      className="btn btn-primary"
+                    <motion.div
+                      className="drop-zone"
+                      onDrop={handleDrop}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
                       onClick={() => fileInputRef.current?.click()}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      transition={{ delay: 0.35 }}
+                      whileHover={{ borderColor: "var(--accent)" }}
                     >
-                      Add Files
-                    </button>
+                      <div className="drop-zone-icon">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                          <polyline points="14 2 14 8 20 8" />
+                          <line x1="12" y1="18" x2="12" y2="12" />
+                          <line x1="9" y1="15" x2="15" y2="15" />
+                        </svg>
+                      </div>
+                      <p className="drop-zone-text">Drop files here or click to browse</p>
+                      <p className="drop-zone-hint">Any file type, any size</p>
+                    </motion.div>
                   ) : (
-                    <div className="selected-files">
+                    <motion.div
+                      className="selected-files"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      transition={{ delay: 0.1 }}
+                    >
                       <div className="file-list-compact">
-                        {files.map((f, i) => (
-                          <div key={i} className="file-tag">
-                            <span className="file-tag-name">{f.name}</span>
-                            <span className="file-tag-size">{formatBytes(f.size)}</span>
-                            <button
-                              className="file-tag-remove"
-                              onClick={() => removeFile(i)}
-                              title="Remove file"
+                        <AnimatePresence>
+                          {files.map((f, i) => (
+                            <motion.div
+                              key={f.name + i}
+                              className="file-tag"
+                              initial={{ opacity: 0, scale: 0.8 }}
+                              animate={{ opacity: 1, scale: 1 }}
+                              exit={{ opacity: 0, scale: 0.8 }}
+                              transition={springConfig}
                             >
-                              ×
-                            </button>
-                          </div>
-                        ))}
+                              <span className="file-tag-name">{f.name}</span>
+                              <span className="file-tag-size">{formatBytes(f.size)}</span>
+                              <button
+                                className="file-tag-remove"
+                                onClick={(e) => { e.stopPropagation(); removeFile(i); }}
+                                title="Remove file"
+                              >
+                                ×
+                              </button>
+                            </motion.div>
+                          ))}
+                        </AnimatePresence>
                       </div>
                       <div className="file-summary">
                         {files.length} file{files.length !== 1 ? "s" : ""} · {formatBytes(files.reduce((sum, f) => sum + f.size, 0))}
                       </div>
                       {sizeWarning && (
-                        <div className="warning-badge">
-                          ⚠ File(s) over 3 GB — may strain browser memory
-                        </div>
+                        <motion.div
+                          className="warning-badge"
+                          initial={{ opacity: 0, y: -8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                        >
+                          Large files may strain browser memory
+                        </motion.div>
                       )}
                       <div className="file-actions">
                         <button className="btn btn-ghost" onClick={() => fileInputRef.current?.click()}>
-                          + Add More
+                          Add More
                         </button>
                         <button className="btn btn-ghost" onClick={() => { setFiles([]); setSizeWarning(false); }}>
-                          Clear All
+                          Clear
                         </button>
                         <button className="btn btn-primary" onClick={handleStartSend}>
-                          Get Code →
+                          Get Code
                         </button>
                       </div>
-                    </div>
+                    </motion.div>
                   )}
                 </motion.div>
 
-                {/* RECEIVE */}
+                {/* RECEIVE CARD */}
                 <motion.div
                   className="home-card receive-card"
-                  whileHover={{ y: -4 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 25 }}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ ...springConfig, delay: 0.2 }}
+                  whileHover={{ y: -4, transition: { duration: 0.2 } }}
                 >
-                  <div className="card-icon">↓</div>
-                  <h2>Receive</h2>
-                  <p>Enter the 6-character code</p>
-                  <div className="code-input-group">
+                  <motion.div
+                    className="card-icon"
+                    initial={{ scale: 0.8, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ ...springConfig, delay: 0.3 }}
+                    style={{ color: "var(--cyan)" }}
+                  >
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="7 10 12 15 17 10" />
+                      <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                  </motion.div>
+                  <motion.h2
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.35 }}
+                  >
+                    Receive
+                  </motion.h2>
+                  <motion.p
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.4 }}
+                  >
+                    Enter the 6-character code
+                  </motion.p>
+                  <motion.div
+                    className="code-input-group"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.45 }}
+                  >
                     <input
                       type="text"
                       maxLength={6}
@@ -348,26 +484,67 @@ export default function App() {
                       spellCheck={false}
                       autoComplete="off"
                     />
-                    <button
+                    <motion.button
                       className="btn btn-primary"
                       onClick={handleJoin}
                       disabled={inputCode.length < 6}
+                      whileHover={{ scale: inputCode.length >= 6 ? 1.02 : 1 }}
+                      whileTap={{ scale: inputCode.length >= 6 ? 0.98 : 1 }}
                     >
-                      Connect →
-                    </button>
-                  </div>
-                  {error && status === "error" && view === "home" && (
-                    <div className="error-msg">{error}</div>
-                  )}
+                      Connect
+                    </motion.button>
+                  </motion.div>
+                  <AnimatePresence>
+                    {error && status === "error" && view === "home" && (
+                      <motion.div
+                        className="error-msg"
+                        initial={{ opacity: 0, y: -8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -8 }}
+                      >
+                        {error}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </motion.div>
               </div>
 
-              <div className="features">
-                <div className="feature"><span>🔒</span> End-to-end encrypted (DTLS)</div>
-                <div className="feature"><span>☁️</span> No cloud storage</div>
-                <div className="feature"><span>⚡</span> Direct P2P transfer</div>
-                <div className="feature"><span>🚫</span> No accounts needed</div>
-              </div>
+              {/* Features */}
+              <motion.div
+                className="features"
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.5, duration: 0.4 }}
+              >
+                <div className="feature">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                  </svg>
+                  End-to-end encrypted
+                </div>
+                <div className="feature">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="2" y1="12" x2="22" y2="12" />
+                    <line x1="12" y1="2" x2="12" y2="22" />
+                    <circle cx="12" cy="12" r="10" />
+                  </svg>
+                  No cloud storage
+                </div>
+                <div className="feature">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                  </svg>
+                  Direct P2P transfer
+                </div>
+                <div className="feature">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+                  </svg>
+                  No accounts needed
+                </div>
+              </motion.div>
             </motion.div>
           )}
 
@@ -376,42 +553,74 @@ export default function App() {
             <motion.div
               key="send"
               className="panel transfer-panel"
-              initial={{ opacity: 0, x: 40 }}
+              initial={{ opacity: 0, x: 32 }}
               animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -40 }}
-              transition={{ duration: 0.35 }}
+              exit={{ opacity: 0, x: -32 }}
+              transition={springConfigGentle}
             >
               {status === "waiting" && (
-                <div className="code-display">
-                  <p className="code-label">Share this code with the receiver</p>
+                <motion.div
+                  className="code-display"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={springConfig}
+                >
+                  <p className="code-label">Share this code</p>
                   <div className="code-big">
                     {code.split("").map((ch, i) => (
                       <motion.span
                         key={i}
                         className="code-char"
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: i * 0.07 }}
+                        initial={{ opacity: 0, y: 24, rotateX: -90 }}
+                        animate={{ opacity: 1, y: 0, rotateX: 0 }}
+                        transition={{
+                          ...springConfig,
+                          delay: i * 0.08,
+                        }}
                       >
                         {ch}
                       </motion.span>
                     ))}
                   </div>
-                  <button
+                  <motion.button
                     className="btn btn-ghost copy-btn"
-                    onClick={() => navigator.clipboard.writeText(code)}
+                    onClick={handleCopyCode}
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
                   >
-                    Copy Code
-                  </button>
-                  <div className="pulse-dot" />
+                    {copied ? "Copied!" : "Copy Code"}
+                  </motion.button>
+                  <motion.div
+                    className="pulse-dot"
+                    initial={{ scale: 0 }}
+                    animate={{ scale: 1 }}
+                    transition={{ delay: 0.6 }}
+                  />
                   <p className="waiting-text">Waiting for receiver…</p>
-                </div>
+                </motion.div>
               )}
 
               {(status === "connected" || status === "transferring" || status === "done") && (
-                <div className="transfer-progress">
+                <motion.div
+                  className="transfer-progress"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.3 }}
+                >
                   <div className="transfer-header">
-                    <h2>{overallDone ? "Transfer Complete ✓" : "Sending…"}</h2>
+                    <h2>
+                      {overallDone ? (
+                        <motion.span
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          style={{ color: "var(--accent)" }}
+                        >
+                          Transfer Complete
+                        </motion.span>
+                      ) : (
+                        "Sending…"
+                      )}
+                    </h2>
                     {connectionState && (
                       <span className={`conn-badge conn-${connectionState}`}>
                         {connectionState}
@@ -425,7 +634,13 @@ export default function App() {
                       const pct = p ? Math.round((p.sent / p.total) * 100) : 0;
                       const isActive = i === currentFileIndex && !p?.done;
                       return (
-                        <div key={i} className={`file-progress-item ${isActive ? "active" : ""} ${p?.done ? "done" : ""}`}>
+                        <motion.div
+                          key={i}
+                          className={`file-progress-item ${isActive ? "active" : ""} ${p?.done ? "done" : ""}`}
+                          initial={{ opacity: 0, y: 16 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ delay: i * 0.05 }}
+                        >
                           <div className="fp-header">
                             <span className="fp-name">{f.name}</span>
                             <span className="fp-size">{formatBytes(f.size)}</span>
@@ -435,7 +650,7 @@ export default function App() {
                               className="progress-bar-fill"
                               initial={{ width: 0 }}
                               animate={{ width: `${pct}%` }}
-                              transition={{ ease: "linear", duration: 0.15 }}
+                              transition={{ ease: "easeOut", duration: 0.2 }}
                             />
                           </div>
                           <div className="fp-stats">
@@ -446,24 +661,40 @@ export default function App() {
                                 <span>ETA {formatTime(p.eta)}</span>
                               </>
                             )}
-                            {p?.done && <span className="done-label">✓ Sent</span>}
+                            {p?.done && (
+                              <motion.span
+                                className="done-label"
+                                initial={{ opacity: 0, scale: 0.8 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                              >
+                                Sent
+                              </motion.span>
+                            )}
                           </div>
-                        </div>
+                        </motion.div>
                       );
                     })}
                   </div>
-                </div>
+                </motion.div>
               )}
 
               {status === "error" && (
-                <div className="error-panel">
+                <motion.div
+                  className="error-panel"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                >
                   <p className="error-msg">{error}</p>
-                </div>
+                </motion.div>
               )}
 
-              <button className="btn btn-ghost back-btn" onClick={reset}>
+              <motion.button
+                className="btn btn-ghost back-btn"
+                onClick={reset}
+                whileHover={{ x: -4 }}
+              >
                 ← Back
-              </button>
+              </motion.button>
             </motion.div>
           )}
 
@@ -472,14 +703,26 @@ export default function App() {
             <motion.div
               key="receive"
               className="panel transfer-panel"
-              initial={{ opacity: 0, x: 40 }}
+              initial={{ opacity: 0, x: 32 }}
               animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -40 }}
-              transition={{ duration: 0.35 }}
+              exit={{ opacity: 0, x: -32 }}
+              transition={springConfigGentle}
             >
               <div className="transfer-progress">
                 <div className="transfer-header">
-                  <h2>{overallDone ? "All Files Received ✓" : "Receiving…"}</h2>
+                  <h2>
+                    {overallDone ? (
+                      <motion.span
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        style={{ color: "var(--accent)" }}
+                      >
+                        All Files Received
+                      </motion.span>
+                    ) : (
+                      "Receiving…"
+                    )}
+                  </h2>
                   {connectionState && (
                     <span className={`conn-badge conn-${connectionState}`}>
                       {connectionState}
@@ -495,7 +738,13 @@ export default function App() {
                       const isActive = i === currentFileIndex && !p?.done;
                       const received = receivedFiles.find((r) => r.name === f.name);
                       return (
-                        <div key={i} className={`file-progress-item ${isActive ? "active" : ""} ${p?.done ? "done" : ""}`}>
+                        <motion.div
+                          key={i}
+                          className={`file-progress-item ${isActive ? "active" : ""} ${p?.done ? "done" : ""}`}
+                          initial={{ opacity: 0, y: 16 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ delay: i * 0.05 }}
+                        >
                           <div className="fp-header">
                             <span className="fp-name">{f.name}</span>
                             <span className="fp-size">{formatBytes(f.size)}</span>
@@ -505,7 +754,7 @@ export default function App() {
                               className="progress-bar-fill"
                               initial={{ width: 0 }}
                               animate={{ width: `${pct}%` }}
-                              transition={{ ease: "linear", duration: 0.15 }}
+                              transition={{ ease: "easeOut", duration: 0.2 }}
                             />
                           </div>
                           <div className="fp-stats">
@@ -517,37 +766,71 @@ export default function App() {
                               </>
                             )}
                             {received && (
-                              <button
+                              <motion.button
                                 className="btn btn-sm btn-download"
                                 onClick={() => downloadFile(received.name, received.blob)}
+                                initial={{ opacity: 0, scale: 0.8 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                                whileHover={{ scale: 1.05 }}
+                                whileTap={{ scale: 0.95 }}
                               >
-                                ↓ Download
-                              </button>
+                                Download
+                              </motion.button>
                             )}
                           </div>
-                        </div>
+                        </motion.div>
                       );
                     })}
                   </div>
                 )}
 
                 {!manifest && status === "connected" && (
-                  <div className="waiting-manifest">
+                  <motion.div
+                    className="waiting-manifest"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                  >
                     <div className="pulse-dot" />
-                    <p>Connected — waiting for file transfer to begin…</p>
-                  </div>
+                    <p>Connected — waiting for transfer…</p>
+                  </motion.div>
                 )}
               </div>
 
-              {status === "error" && (
-                <div className="error-panel">
-                  <p className="error-msg">{error}</p>
-                </div>
+              {overallDone && receivedFiles.length > 1 && (
+                <motion.div
+                  style={{ marginTop: "1rem", display: "flex", justifyContent: "center" }}
+                  initial={{ opacity: 0, y: 16 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.3 }}
+                >
+                  <motion.button
+                    className="btn btn-primary"
+                    onClick={downloadAll}
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    Download All
+                  </motion.button>
+                </motion.div>
               )}
 
-              <button className="btn btn-ghost back-btn" onClick={reset}>
+              {status === "error" && (
+                <motion.div
+                  className="error-panel"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                >
+                  <p className="error-msg">{error}</p>
+                </motion.div>
+              )}
+
+              <motion.button
+                className="btn btn-ghost back-btn"
+                onClick={reset}
+                whileHover={{ x: -4 }}
+              >
                 ← Back
-              </button>
+              </motion.button>
             </motion.div>
           )}
         </AnimatePresence>
