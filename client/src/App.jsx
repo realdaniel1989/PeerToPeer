@@ -64,10 +64,15 @@ export default function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [copied, setCopied] = useState(false);
   const [zipping, setZipping] = useState(false);
+  const [sendMode, setSendMode] = useState("files"); // "files" | "text"
+  const [textContent, setTextContent] = useState("");
+  const [receivedText, setReceivedText] = useState(null); // null | string
+  const [textCopied, setTextCopied] = useState(false);
 
   const socketRef = useRef(null);
   const peerRef = useRef(null);
   const fileInputRef = useRef(null);
+  const manifestRef = useRef(null);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -91,12 +96,17 @@ export default function App() {
     setFileProgress({});
     setReceivedFiles([]);
     setManifest(null);
+    manifestRef.current = null;
     setCurrentFileIndex(-1);
     setConnectionState("");
     setOverallDone(false);
     setSizeWarning(false);
     setIsDragOver(false);
     setCopied(false);
+    setSendMode("files");
+    setTextContent("");
+    setReceivedText(null);
+    setTextCopied(false);
   };
 
   // ── FILE HANDLING ──
@@ -144,10 +154,25 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // ── SENDER FLOW ──
-  const handleStartSend = useCallback(() => {
-    if (!files.length) return;
+  const handleCopyText = async () => {
+    try {
+      await navigator.clipboard.writeText(receivedText);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = receivedText;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    setTextCopied(true);
+    setTimeout(() => setTextCopied(false), 2000);
+  };
 
+  // ── SENDER FLOW ──
+  const startSend = useCallback((fileList) => {
     const socket = io(SIGNAL_URL, { transports: ["websocket"] });
     socketRef.current = socket;
 
@@ -168,7 +193,7 @@ export default function App() {
         onConnectionState: (s) => setConnectionState(s),
         onChannelOpen: () => {
           setStatus("transferring");
-          peer.sendFiles(files);
+          peer.sendFiles(fileList);
         },
         onChannelClose: () => {},
         onSendFileStart: (idx) => setCurrentFileIndex(idx),
@@ -200,7 +225,20 @@ export default function App() {
       setError("Cannot reach signaling server.");
       setStatus("error");
     });
-  }, [files, status]);
+  }, [status]);
+
+  const handleStartSend = useCallback(() => {
+    if (!files.length) return;
+    startSend(files);
+  }, [files, startSend]);
+
+  const handleStartSendText = useCallback(() => {
+    if (!textContent.trim()) return;
+    const blob = new Blob([textContent], { type: "text/plain" });
+    const file = new File([blob], "shared-text.txt", { type: "text/plain" });
+    file._isText = true;
+    startSend([file]);
+  }, [textContent, startSend]);
 
   // ── RECEIVER FLOW ──
   const handleJoin = useCallback(() => {
@@ -223,12 +261,21 @@ export default function App() {
           onConnectionState: (s) => setConnectionState(s),
           onChannelOpen: () => setStatus("transferring"),
           onChannelClose: () => {},
-          onManifest: (m) => setManifest(m),
+          onManifest: (m) => {
+            manifestRef.current = m;
+            setManifest(m);
+          },
           onReceiveFileStart: (idx) => setCurrentFileIndex(idx),
           onReceiveProgress: (idx, received, total, speed, eta) => {
             setFileProgress((prev) => ({ ...prev, [idx]: { sent: received, total, speed, eta } }));
           },
-          onReceiveFileComplete: (idx, name, blob) => {
+          onReceiveFileComplete: async (idx, name, blob) => {
+            const m = manifestRef.current;
+            const isTextFile = m?.[idx]?.isText || m?.[0]?.isText;
+            if (isTextFile) {
+              const text = await blob.text();
+              setReceivedText(text);
+            }
             setReceivedFiles((prev) => [...prev, { name, blob }]);
             setFileProgress((prev) => ({
               ...prev,
@@ -362,12 +409,43 @@ export default function App() {
                     Send
                   </motion.h2>
                   <motion.p
+                    className="send-description"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     transition={{ delay: 0.3 }}
                   >
-                    Select files and get a code to share
+                    {sendMode === "files" ? "Select files and get a code to share" : "Paste text and get a code to share"}
                   </motion.p>
+
+                  {/* Mode Toggle */}
+                  <motion.div
+                    className="mode-toggle"
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.32 }}
+                  >
+                    <button
+                      className={`mode-toggle-btn ${sendMode === "files" ? "active" : ""}`}
+                      onClick={() => setSendMode("files")}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <polyline points="14 2 14 8 20 8" />
+                      </svg>
+                      Files
+                    </button>
+                    <button
+                      className={`mode-toggle-btn ${sendMode === "text" ? "active" : ""}`}
+                      onClick={() => setSendMode("text")}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="4 7 4 4 20 4 20 7" />
+                        <line x1="9" y1="20" x2="15" y2="20" />
+                        <line x1="12" y1="4" x2="12" y2="20" />
+                      </svg>
+                      Text
+                    </button>
+                  </motion.div>
 
                   <input
                     type="file"
@@ -377,83 +455,124 @@ export default function App() {
                     className="file-input-hidden"
                   />
 
-                  {files.length === 0 ? (
-                    <motion.div
-                      className="drop-zone"
-                      onDrop={handleDrop}
-                      onDragOver={handleDragOver}
-                      onDragLeave={handleDragLeave}
-                      onClick={() => fileInputRef.current?.click()}
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      transition={{ delay: 0.35 }}
-                      whileHover={{ borderColor: "var(--accent)" }}
-                    >
-                      <div className="drop-zone-icon">
-                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                          <polyline points="14 2 14 8 20 8" />
-                          <line x1="12" y1="18" x2="12" y2="12" />
-                          <line x1="9" y1="15" x2="15" y2="15" />
-                        </svg>
-                      </div>
-                      <p className="drop-zone-text">Drop files here or click to browse</p>
-                      <p className="drop-zone-hint">Any file type, any size</p>
-                    </motion.div>
-                  ) : (
-                    <motion.div
-                      className="selected-files"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      transition={{ delay: 0.1 }}
-                    >
-                      <div className="file-list-compact">
-                        <AnimatePresence>
-                          {files.map((f, i) => (
-                            <motion.div
-                              key={f.name + i}
-                              className="file-tag"
-                              initial={{ opacity: 0, scale: 0.8 }}
-                              animate={{ opacity: 1, scale: 1 }}
-                              exit={{ opacity: 0, scale: 0.8 }}
-                              transition={springConfig}
-                            >
-                              <span className="file-tag-name">{f.name}</span>
-                              <span className="file-tag-size">{formatBytes(f.size)}</span>
-                              <button
-                                className="file-tag-remove"
-                                onClick={(e) => { e.stopPropagation(); removeFile(i); }}
-                                title="Remove file"
-                              >
-                                ×
-                              </button>
-                            </motion.div>
-                          ))}
-                        </AnimatePresence>
-                      </div>
-                      <div className="file-summary">
-                        {files.length} file{files.length !== 1 ? "s" : ""} · {formatBytes(files.reduce((sum, f) => sum + f.size, 0))}
-                      </div>
-                      {sizeWarning && (
+                  {sendMode === "files" ? (
+                    <>
+                      {files.length === 0 ? (
                         <motion.div
-                          className="warning-badge"
-                          initial={{ opacity: 0, y: -8 }}
-                          animate={{ opacity: 1, y: 0 }}
+                          className="drop-zone"
+                          onDrop={handleDrop}
+                          onDragOver={handleDragOver}
+                          onDragLeave={handleDragLeave}
+                          onClick={() => fileInputRef.current?.click()}
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          transition={{ delay: 0.35 }}
+                          whileHover={{ borderColor: "var(--accent)" }}
                         >
-                          Large files may strain browser memory
+                          <div className="drop-zone-icon">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                              <polyline points="14 2 14 8 20 8" />
+                              <line x1="12" y1="18" x2="12" y2="12" />
+                              <line x1="9" y1="15" x2="15" y2="15" />
+                            </svg>
+                          </div>
+                          <p className="drop-zone-text">Drop files here or click to browse</p>
+                          <p className="drop-zone-hint">Any file type, any size</p>
+                        </motion.div>
+                      ) : (
+                        <motion.div
+                          className="selected-files"
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          transition={{ delay: 0.1 }}
+                        >
+                          <div className="file-list-compact">
+                            <AnimatePresence>
+                              {files.map((f, i) => (
+                                <motion.div
+                                  key={f.name + i}
+                                  className="file-tag"
+                                  initial={{ opacity: 0, scale: 0.8 }}
+                                  animate={{ opacity: 1, scale: 1 }}
+                                  exit={{ opacity: 0, scale: 0.8 }}
+                                  transition={springConfig}
+                                >
+                                  <span className="file-tag-name">{f.name}</span>
+                                  <span className="file-tag-size">{formatBytes(f.size)}</span>
+                                  <button
+                                    className="file-tag-remove"
+                                    onClick={(e) => { e.stopPropagation(); removeFile(i); }}
+                                    title="Remove file"
+                                  >
+                                    ×
+                                  </button>
+                                </motion.div>
+                              ))}
+                            </AnimatePresence>
+                          </div>
+                          <div className="file-summary">
+                            {files.length} file{files.length !== 1 ? "s" : ""} · {formatBytes(files.reduce((sum, f) => sum + f.size, 0))}
+                          </div>
+                          {sizeWarning && (
+                            <motion.div
+                              className="warning-badge"
+                              initial={{ opacity: 0, y: -8 }}
+                              animate={{ opacity: 1, y: 0 }}
+                            >
+                              Large files may strain browser memory
+                            </motion.div>
+                          )}
+                          <div className="file-actions">
+                            <button className="btn btn-ghost" onClick={() => fileInputRef.current?.click()}>
+                              Add More
+                            </button>
+                            <button className="btn btn-ghost" onClick={() => { setFiles([]); setSizeWarning(false); }}>
+                              Clear
+                            </button>
+                            <button className="btn btn-primary" onClick={handleStartSend}>
+                              Get Code
+                            </button>
+                          </div>
                         </motion.div>
                       )}
-                      <div className="file-actions">
-                        <button className="btn btn-ghost" onClick={() => fileInputRef.current?.click()}>
-                          Add More
-                        </button>
-                        <button className="btn btn-ghost" onClick={() => { setFiles([]); setSizeWarning(false); }}>
-                          Clear
-                        </button>
-                        <button className="btn btn-primary" onClick={handleStartSend}>
-                          Get Code
-                        </button>
+                    </>
+                  ) : (
+                    <motion.div
+                      className="text-send-section"
+                      initial={{ opacity: 0, y: 12 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: 0.1 }}
+                    >
+                      <textarea
+                        className="text-input-area"
+                        value={textContent}
+                        onChange={(e) => setTextContent(e.target.value)}
+                        placeholder="Type or paste text to share…"
+                        spellCheck={false}
+                      />
+                      <div className="text-meta">
+                        {textContent.length > 0 && (
+                          <>
+                            <span>{textContent.length.toLocaleString()} character{textContent.length !== 1 ? "s" : ""}</span>
+                            <span>·</span>
+                            <span>{textContent.split("\n").length} line{textContent.split("\n").length !== 1 ? "s" : ""}</span>
+                            {textContent.length > 1_000_000 && (
+                              <>
+                                <span>·</span>
+                                <span className="text-meta-warning">Large text — consider using file mode</span>
+                              </>
+                            )}
+                          </>
+                        )}
                       </div>
+                      <button
+                        className="btn btn-primary"
+                        onClick={handleStartSendText}
+                        disabled={!textContent.trim()}
+                      >
+                        Get Code
+                      </button>
                     </motion.div>
                   )}
                 </motion.div>
@@ -737,7 +856,15 @@ export default function App() {
               <div className="transfer-progress">
                 <div className="transfer-header">
                   <h2>
-                    {overallDone ? (
+                    {overallDone && receivedText !== null ? (
+                      <motion.span
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        style={{ color: "var(--accent)" }}
+                      >
+                        Text Received
+                      </motion.span>
+                    ) : overallDone ? (
                       <motion.span
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
@@ -756,7 +883,50 @@ export default function App() {
                   )}
                 </div>
 
-                {manifest && (
+                {/* Text receive view */}
+                {overallDone && receivedText !== null && (
+                  <motion.div
+                    className="text-received-section"
+                    initial={{ opacity: 0, y: 16 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.1 }}
+                  >
+                    <div className="received-text-container">
+                      <pre className="received-text-content">{receivedText}</pre>
+                    </div>
+                    <div className="text-meta">
+                      <span>{receivedText.length.toLocaleString()} character{receivedText.length !== 1 ? "s" : ""}</span>
+                      <span>·</span>
+                      <span>{receivedText.split("\n").length} line{receivedText.split("\n").length !== 1 ? "s" : ""}</span>
+                    </div>
+                    <motion.button
+                      className={`btn btn-primary copy-text-btn ${textCopied ? "copied" : ""}`}
+                      onClick={handleCopyText}
+                      whileHover={{ scale: textCopied ? 1 : 1.02 }}
+                      whileTap={{ scale: textCopied ? 1 : 0.98 }}
+                    >
+                      {textCopied ? (
+                        <>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12" />
+                          </svg>
+                          Copied!
+                        </>
+                      ) : (
+                        <>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                          </svg>
+                          Copy Text
+                        </>
+                      )}
+                    </motion.button>
+                  </motion.div>
+                )}
+
+                {/* File receive view (only shown when not a text transfer) */}
+                {manifest && receivedText === null && (
                   <div className="file-progress-list">
                     {manifest.map((f, i) => {
                       const p = fileProgress[i];
@@ -822,7 +992,7 @@ export default function App() {
                 )}
               </div>
 
-              {overallDone && receivedFiles.length > 1 && (
+              {overallDone && receivedText === null && receivedFiles.length > 1 && (
                 <motion.div
                   style={{ marginTop: "1rem", display: "flex", justifyContent: "center" }}
                   initial={{ opacity: 0, y: 16 }}

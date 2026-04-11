@@ -1023,6 +1023,195 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
+/* ── Mode Toggle ── */
+.mode-toggle {
+  display: flex;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  gap: 2px;
+}
+
+.mode-toggle-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-family: var(--font-system);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border-radius: calc(var(--radius-md) - 2px);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.mode-toggle-btn:hover {
+  color: var(--text-secondary);
+}
+
+.mode-toggle-btn.active {
+  background: var(--bg-card-hover);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* ── Text Input Area (Sender) ── */
+.text-send-section {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.text-input-area {
+  width: 100%;
+  min-height: 120px;
+  max-height: 300px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  outline: none;
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
+  box-shadow: var(--shadow-inset);
+}
+
+.text-input-area::placeholder {
+  color: var(--text-quaternary);
+}
+
+.text-input-area:focus {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 3px var(--accent-glow),
+    var(--shadow-inset);
+}
+
+/* ── Text Meta (character/line count) ── */
+.text-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  min-height: 1.2em;
+}
+
+.text-meta-warning {
+  color: var(--orange);
+}
+
+/* ── Text Received Section (Receiver) ── */
+.text-received-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-5);
+}
+
+.received-text-container {
+  width: 100%;
+  max-height: 400px;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4) var(--space-5);
+  box-shadow: var(--shadow-inset);
+  position: relative;
+}
+
+/* Custom scrollbar for text container */
+.received-text-container::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.received-text-container::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.received-text-container::-webkit-scrollbar-thumb {
+  background: var(--text-quaternary);
+  border-radius: 3px;
+}
+
+.received-text-container::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+.received-text-content {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  user-select: all;
+}
+
+/* ── Copy Text Button ── */
+.copy-text-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 160px;
+  justify-content: center;
+  padding: var(--space-3) var(--space-6);
+}
+
+.copy-text-btn.copied {
+  background: var(--accent-hover);
+  pointer-events: none;
+}
+
+/* ── Responsive tweaks for new components ── */
+@media (max-width: 640px) {
+  .text-input-area {
+    min-height: 100px;
+    font-size: 0.75rem;
+  }
+
+  .received-text-container {
+    max-height: 300px;
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .received-text-content {
+    font-size: 0.75rem;
+  }
+}
+
+@media (max-width: 375px) {
+  .text-input-area {
+    min-height: 80px;
+  }
+
+  .mode-toggle-btn {
+    font-size: 0.75rem;
+    padding: var(--space-2) var(--space-3);
+  }
+}
+
 /* ── Reduced Motion ── */
 @media (prefers-reduced-motion: reduce) {
   *,

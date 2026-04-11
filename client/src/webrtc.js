@@ -240,7 +240,7 @@ export function createPeerConnection(socket, role, callbacks) {
     // ── WebRTC path ──
     if (!dc || dc.readyState !== "open") throw new Error("DataChannel not open");
     const fileList = Array.from(files);
-    const manifest = fileList.map((f) => ({ name: f.name, size: f.size, type: f.type }));
+    const manifest = fileList.map((f) => ({ name: f.name, size: f.size, type: f.type, isText: !!f._isText }));
     dc.send(JSON.stringify({ type: "manifest", files: manifest }));
 
     for (let fi = 0; fi < fileList.length; fi++) {
@@ -273,7 +273,7 @@ export function createPeerConnection(socket, role, callbacks) {
     const fileList = Array.from(files);
 
     // 1. Manifest
-    const manifest = fileList.map((f) => ({ name: f.name, size: f.size, type: f.type }));
+    const manifest = fileList.map((f) => ({ name: f.name, size: f.size, type: f.type, isText: !!f._isText }));
     socket.emit("relay-manifest", manifest);
     await delay(200); // receiver needs time to process manifest
 
