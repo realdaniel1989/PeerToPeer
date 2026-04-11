@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { io } from "socket.io-client";
 import { motion, AnimatePresence } from "motion/react";
+import JSZip from "jszip";
 import { createPeerConnection } from "./webrtc.js";
 import "./styles.css";
 
@@ -62,6 +63,7 @@ export default function App() {
   const [sizeWarning, setSizeWarning] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [zipping, setZipping] = useState(false);
 
   const socketRef = useRef(null);
   const peerRef = useRef(null);
@@ -261,11 +263,35 @@ export default function App() {
     a.href = url;
     a.download = name;
     a.click();
-    URL.revokeObjectURL(url);
+    // Delay revocation so the browser has time to initiate the download
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
   };
 
-  const downloadAll = () => {
-    receivedFiles.forEach(({ name, blob }) => downloadFile(name, blob));
+  const downloadAll = async () => {
+    setZipping(true);
+    try {
+      const zip = new JSZip();
+      const nameCount = {};
+      receivedFiles.forEach(({ name, blob }) => {
+        let finalName = name;
+        if (nameCount[name]) {
+          const ext = name.includes(".") ? "." + name.split(".").pop() : "";
+          const base = name.includes(".") ? name.slice(0, name.lastIndexOf(".")) : name;
+          finalName = `${base} (${nameCount[name]})${ext}`;
+        }
+        nameCount[name] = (nameCount[name] || 0) + 1;
+        zip.file(finalName, blob);
+      });
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "dropp-files.zip";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } finally {
+      setZipping(false);
+    }
   };
 
   // ── RENDER ──
@@ -806,10 +832,11 @@ export default function App() {
                   <motion.button
                     className="btn btn-primary"
                     onClick={downloadAll}
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
+                    disabled={zipping}
+                    whileHover={zipping ? {} : { scale: 1.02 }}
+                    whileTap={zipping ? {} : { scale: 0.98 }}
                   >
-                    Download All
+                    {zipping ? "Zipping files…" : "Download All"}
                   </motion.button>
                 </motion.div>
               )}
