@@ -389,6 +389,20 @@ body {
   background: rgba(255, 255, 255, 0.03);
 }
 
+/* Stack input and Connect button vertically, same width */
+.code-input-group {
+  flex-direction: column;
+  max-width: 260px;
+}
+
+.code-input-group .code-input {
+  width: 100%;
+}
+
+.code-input-group .btn-primary {
+  width: 100%;
+}
+
 /* Small Button */
 .btn-sm {
   padding: var(--space-2) var(--space-3);
@@ -565,12 +579,7 @@ body {
   max-width: 260px;
 }
 
-@media (max-width: 480px) {
-  .code-input-group {
-    flex-direction: column;
-    max-width: 200px;
-  }
-}
+/* 480px breakpoint removed — code-input-group is now column layout at all sizes */
 
 .code-input {
   flex: 1;
