@@ -68,11 +68,15 @@ export default function App() {
   const [textContent, setTextContent] = useState("");
   const [receivedText, setReceivedText] = useState(null); // null | string
   const [textCopied, setTextCopied] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   const socketRef = useRef(null);
   const peerRef = useRef(null);
   const fileInputRef = useRef(null);
   const manifestRef = useRef(null);
+  // Socket handlers live for the whole session, so they read status through a ref
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   // Cleanup on unmount
   useEffect(() => {
@@ -107,6 +111,37 @@ export default function App() {
     setTextContent("");
     setReceivedText(null);
     setTextCopied(false);
+    setReconnecting(false);
+  };
+
+  // Keep the session alive across dropped connections (proxy timeouts, network
+  // blips): on reconnect we reclaim our seat in the room instead of starting over,
+  // and the relay transfer resumes from the receiver's last confirmed byte.
+  const attachReconnectHandlers = (socket, role, getSession) => {
+    const isActive = () => statusRef.current !== "done" && statusRef.current !== "error";
+    const fail = (msg) => {
+      if (!isActive()) return;
+      peerRef.current?.destroy();
+      setReconnecting(false);
+      setError(msg);
+      setStatus("error");
+    };
+
+    socket.on("disconnect", () => { if (isActive()) setReconnecting(true); });
+    socket.on("peer-away", () => { if (isActive()) setReconnecting(true); });
+    socket.on("peer-back", () => setReconnecting(false));
+    socket.on("peer-disconnected", () => fail(role === "sender" ? "Receiver disconnected." : "Sender disconnected."));
+
+    // Returns true if this "connect" was a reconnect that has been handled
+    return () => {
+      const session = getSession();
+      if (!session) return false;
+      socket.emit("rejoin-room", { ...session, role }, (res) => {
+        if (res?.error) return fail(`Connection lost: ${res.error}`);
+        setReconnecting(!res.peerPresent && isActive());
+      });
+      return true;
+    };
   };
 
   // ── FILE HANDLING ──
@@ -175,10 +210,14 @@ export default function App() {
   const startSend = useCallback((fileList) => {
     const socket = io(SIGNAL_URL, { transports: ["websocket"] });
     socketRef.current = socket;
+    let session = null; // { code, token } once the room exists
+    const rejoin = attachReconnectHandlers(socket, "sender", () => session);
 
     socket.on("connect", () => {
+      if (rejoin()) return;
       socket.emit("create-room", (res) => {
         if (res.code) {
+          session = { code: res.code, token: res.token };
           setCode(res.code);
           setStatus("waiting");
           setView("send");
@@ -188,6 +227,8 @@ export default function App() {
 
     socket.on("peer-joined", () => {
       setStatus("connected");
+      setReconnecting(false);
+      peerRef.current?.destroy();
 
       const peer = createPeerConnection(socket, "sender", {
         onConnectionState: (s) => setConnectionState(s),
@@ -200,32 +241,28 @@ export default function App() {
         onSendProgress: (idx, sent, total, speed, eta) => {
           setFileProgress((prev) => ({ ...prev, [idx]: { sent, total, speed, eta } }));
         },
-        onSendFileComplete: (idx) => {
+        onSendFileComplete: (idx, size) => {
           setFileProgress((prev) => ({
             ...prev,
-            [idx]: { ...prev[idx], sent: prev[idx].total, done: true },
+            [idx]: { ...prev[idx], sent: size, total: size, done: true },
           }));
         },
         onAllSendComplete: () => {
           setStatus("done");
           setOverallDone(true);
+          setReconnecting(false);
         },
       });
       peerRef.current = peer;
     });
 
-    socket.on("peer-disconnected", () => {
-      if (status !== "done") {
-        setError("Receiver disconnected.");
-        setStatus("error");
-      }
-    });
-
     socket.on("connect_error", () => {
+      // During a session socket.io keeps retrying on its own; only the first connect is fatal
+      if (session) return;
       setError("Cannot reach signaling server.");
       setStatus("error");
     });
-  }, [status]);
+  }, []);
 
   const handleStartSend = useCallback(() => {
     if (!files.length) return;
@@ -246,14 +283,19 @@ export default function App() {
 
     const socket = io(SIGNAL_URL, { transports: ["websocket"] });
     socketRef.current = socket;
+    const roomCode = inputCode.toUpperCase().trim();
+    let session = null; // { code, token } once joined
+    const rejoin = attachReconnectHandlers(socket, "receiver", () => session);
 
     socket.on("connect", () => {
-      socket.emit("join-room", inputCode.toUpperCase(), (res) => {
+      if (rejoin()) return;
+      socket.emit("join-room", roomCode, (res) => {
         if (res.error) {
           setError(res.error);
           setStatus("error");
           return;
         }
+        session = { code: roomCode, token: res.token };
         setStatus("connected");
         setView("receive");
 
@@ -279,30 +321,26 @@ export default function App() {
             setReceivedFiles((prev) => [...prev, { name, blob }]);
             setFileProgress((prev) => ({
               ...prev,
-              [idx]: { ...prev[idx], sent: prev[idx].total, done: true },
+              [idx]: { ...prev[idx], sent: blob.size, total: blob.size, done: true },
             }));
           },
           onAllReceiveComplete: () => {
             setStatus("done");
             setOverallDone(true);
+            setReconnecting(false);
           },
         });
         peerRef.current = peer;
       });
     });
 
-    socket.on("peer-disconnected", () => {
-      if (status !== "done") {
-        setError("Sender disconnected.");
-        setStatus("error");
-      }
-    });
-
     socket.on("connect_error", () => {
+      // During a session socket.io keeps retrying on its own; only the first connect is fatal
+      if (session) return;
       setError("Cannot reach signaling server.");
       setStatus("error");
     });
-  }, [inputCode, status]);
+  }, [inputCode]);
 
   const downloadFile = (name, blob) => {
     const url = URL.createObjectURL(blob);
@@ -342,6 +380,7 @@ export default function App() {
   };
 
   // ── RENDER ──
+  const badgeState = reconnecting ? "reconnecting" : connectionState;
   return (
     <div className="app">
       <div className="noise" />
@@ -766,9 +805,9 @@ export default function App() {
                         "Sending…"
                       )}
                     </h2>
-                    {connectionState && (
-                      <span className={`conn-badge conn-${connectionState}`}>
-                        {connectionState}
+                    {badgeState && (
+                      <span className={`conn-badge conn-${badgeState}`}>
+                        {badgeState}
                       </span>
                     )}
                   </div>
@@ -876,9 +915,9 @@ export default function App() {
                       "Receiving…"
                     )}
                   </h2>
-                  {connectionState && (
-                    <span className={`conn-badge conn-${connectionState}`}>
-                      {connectionState}
+                  {badgeState && (
+                    <span className={`conn-badge conn-${badgeState}`}>
+                      {badgeState}
                     </span>
                   )}
                 </div>

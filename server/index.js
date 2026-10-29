@@ -18,10 +18,17 @@ app.use(express.static(distPath));
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 5e6, // 5 MB per message (base64 chunk ≈ 22 KB)
+  maxHttpBufferSize: 5e6, // 5 MB per message (relay chunk = 256 KB binary)
+  pingTimeout: 60_000, // tolerate slow / inspecting proxies before declaring a peer dead
 });
 
-// Maps: code -> { sender, receiver, transferMode }
+// How long a peer may be disconnected before its seat in the room is given up.
+// Within this window it can reconnect and the transfer resumes where it stopped.
+const RECONNECT_GRACE_MS = 5 * 60_000;
+// How long the server waits for the other peer to acknowledge a relayed message.
+const RELAY_ACK_TIMEOUT_MS = 30_000;
+
+// Maps: code -> { sender, receiver, senderToken, receiverToken, transferMode, graceTimers }
 const rooms = new Map();
 
 function generateCode() {
@@ -32,6 +39,9 @@ function generateCode() {
   return code;
 }
 
+const generateToken = () => crypto.randomBytes(16).toString("hex");
+const otherRole = (role) => (role === "sender" ? "receiver" : "sender");
+
 io.on("connection", (socket) => {
   console.log(`[+] ${socket.id}`);
 
@@ -39,27 +49,56 @@ io.on("connection", (socket) => {
   socket.on("create-room", (callback) => {
     let code;
     do { code = generateCode(); } while (rooms.has(code));
-    rooms.set(code, { sender: socket.id, receiver: null, transferMode: "webrtc" });
+    const token = generateToken();
+    rooms.set(code, {
+      sender: socket.id, receiver: null,
+      senderToken: token, receiverToken: null,
+      transferMode: "webrtc", graceTimers: {},
+    });
     socket.join(code);
     socket.data.code = code;
     socket.data.role = "sender";
     console.log(`[room] ${code} created by ${socket.id}`);
-    callback({ code });
+    callback({ code, token });
   });
 
   socket.on("join-room", (code, callback) => {
     const upper = code.toUpperCase().trim();
     const room = rooms.get(upper);
     if (!room) return callback({ error: "Invalid code. No active session found." });
-    if (room.receiver) return callback({ error: "Session already has a receiver connected." });
+    if (room.receiverToken) return callback({ error: "Session already has a receiver connected." });
 
+    const token = generateToken();
     room.receiver = socket.id;
+    room.receiverToken = token;
     socket.join(upper);
     socket.data.code = upper;
     socket.data.role = "receiver";
     io.to(room.sender).emit("peer-joined");
     console.log(`[room] ${upper} receiver joined: ${socket.id}`);
-    callback({ ok: true });
+    callback({ ok: true, token });
+  });
+
+  // Reconnect after a dropped connection (new socket id, same seat in the room)
+  socket.on("rejoin-room", ({ code, role, token } = {}, callback) => {
+    const room = code && rooms.get(code);
+    if (!room || !token || room[`${role}Token`] !== token) {
+      return callback?.({ error: "Session expired." });
+    }
+    clearTimeout(room.graceTimers[role]);
+    delete room.graceTimers[role];
+    room[role] = socket.id;
+    socket.join(code);
+    socket.data.code = code;
+    socket.data.role = role;
+    console.log(`[room] ${code} ${role} rejoined: ${socket.id}`);
+
+    const peerId = room[otherRole(role)];
+    const peerPresent = !!(peerId && io.sockets.sockets.get(peerId));
+    if (peerPresent) io.to(peerId).emit("peer-back");
+    // A receiver that missed the switch while offline still needs to hear it
+    if (role === "receiver" && room.transferMode === "relay") socket.emit("relay-mode");
+    callback?.({ ok: true, peerPresent, transferMode: room.transferMode });
   });
 
   // ── WebRTC signaling relay ──
@@ -77,71 +116,51 @@ io.on("connection", (socket) => {
 
     room.transferMode = "relay";
     console.log(`[relay] ${code} switched to relay mode`);
-    io.to(room.receiver).emit("relay-mode");
+    if (room.receiver) io.to(room.receiver).emit("relay-mode");
     callback({ ok: true });
   });
 
-  // Manifest: sender → server → receiver
-  socket.on("relay-manifest", (manifest) => {
+  // Relay message: one peer → server → other peer, acknowledged END-TO-END.
+  // The sender's ack only fires once the receiver has actually processed the
+  // message, so the server never holds more than the sender's in-flight window
+  // (instead of buffering the whole file while a slow receiver catches up).
+  socket.on("relay", (msg, ack) => {
+    if (typeof ack !== "function") return;
     const code = socket.data.code;
-    if (code) {
-      console.log(`[relay] ${code} manifest: ${manifest.length} file(s)`);
-      socket.to(code).emit("relay-manifest", manifest);
-    }
+    const room = code && rooms.get(code);
+    if (!room) return ack({ error: "no-room" });
+
+    const peer = io.sockets.sockets.get(room[otherRole(socket.data.role)]);
+    if (!peer) return ack({ error: "peer-away" });
+
+    if (msg?.type !== "chunk") console.log(`[relay] ${code} ${msg?.type}`);
+    peer.timeout(RELAY_ACK_TIMEOUT_MS).emit("relay", msg, (err, res) => {
+      ack(err ? { error: "peer-timeout" } : res);
+    });
   });
 
-  // File-start: sender → server → receiver (carries name, size, mimeType)
-  socket.on("relay-file-start", (info) => {
-    const code = socket.data.code;
-    if (code) {
-      console.log(`[relay] ${code} file-start: ${info.name} (${info.size} bytes)`);
-      socket.to(code).emit("relay-file-start", info);
-    }
-  });
+  // ── Disconnect: hold the seat for a grace period so the peer can reconnect ──
+  socket.on("disconnect", (reason) => {
+    const { code, role } = socket.data;
+    const room = code && rooms.get(code);
+    console.log(`[-] ${socket.id} (${reason})`);
+    // Ignore stale sockets that were already replaced by a rejoin
+    if (!room || room[role] !== socket.id) return;
 
-  // Chunk: sender → server → receiver (with ack back to sender)
-  socket.on("relay-chunk", (data, ack) => {
-    const code = socket.data.code;
-    if (code) {
-      socket.to(code).emit("relay-chunk", data);
-    }
-    // Acknowledge to sender so it can send next chunk (backpressure)
-    if (typeof ack === "function") ack();
-  });
-
-  // File-complete: sender → server → receiver
-  socket.on("relay-file-complete", (index, ack) => {
-    const code = socket.data.code;
-    if (code) {
-      console.log(`[relay] ${code} file-complete: index=${index}`);
-      socket.to(code).emit("relay-file-complete", index);
-    }
-    if (typeof ack === "function") ack();
-  });
-
-  // Transfer-complete: sender → server → receiver
-  socket.on("relay-transfer-complete", () => {
-    const code = socket.data.code;
-    if (code) {
-      console.log(`[relay] ${code} transfer-complete`);
-      socket.to(code).emit("relay-transfer-complete");
-    }
-  });
-
-  // ── Disconnect cleanup ──
-  socket.on("disconnect", () => {
-    const code = socket.data.code;
-    if (code && rooms.has(code)) {
-      const room = rooms.get(code);
-      socket.to(code).emit("peer-disconnected");
-      if (socket.data.role === "sender") {
+    io.to(code).emit("peer-away");
+    room.graceTimers[role] = setTimeout(() => {
+      delete room.graceTimers[role];
+      io.to(code).emit("peer-disconnected");
+      if (role === "sender") {
+        Object.values(room.graceTimers).forEach(clearTimeout);
         rooms.delete(code);
-        console.log(`[room] ${code} destroyed (sender left)`);
+        console.log(`[room] ${code} destroyed (sender gone)`);
       } else {
         room.receiver = null;
+        room.receiverToken = null;
+        console.log(`[room] ${code} receiver seat released`);
       }
-    }
-    console.log(`[-] ${socket.id}`);
+    }, RECONNECT_GRACE_MS);
   });
 });
 

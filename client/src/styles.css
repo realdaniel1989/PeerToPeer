@@ -759,7 +759,8 @@ body {
 }
 
 .conn-connecting,
-.conn-new {
+.conn-new,
+.conn-reconnecting {
   color: var(--orange);
   background: rgba(255, 159, 10, 0.1);
   border: 1px solid rgba(255, 159, 10, 0.25);
